@@ -534,3 +534,315 @@ Documents this specific training run end-to-end: RunPod setup, disk space manage
 - `scripts/base_train.py`, `chat_sft.py`, `chat_eval.py` — training scripts untouched
 - `tasks/` — SFT dataset definitions untouched
 - `pyproject.toml` / `uv.lock` — dependencies untouched
+
+---
+
+## Spinning Up a RunPod Inference Instance
+
+Your trained SFT model is stored on the RunPod **volume** at `/workspace/nanochat_cache/`. The volume persists independently of the pod, so you don't need to retrain — just attach it to a cheap new pod.
+
+### GPU sizing
+
+The SFT model is 1.38B parameters in bfloat16 ≈ **~2.8 GB VRAM**. Any modern GPU works. Recommended cheapest options on RunPod:
+
+| GPU | VRAM | Approx cost | Notes |
+|-----|------|-------------|-------|
+| RTX 4090 | 24 GB | ~$0.74/hr spot | Fast, cheap, widely available |
+| RTX 3090 | 24 GB | ~$0.44/hr spot | Good value |
+| A40 | 48 GB | ~$0.76/hr spot | More headroom |
+| A100 (40GB) | 40 GB | ~$1.10/hr spot | Overkill but fast |
+
+You do **not** need 8×H100 for inference. A single consumer GPU is more than enough.
+
+---
+
+### Step 1 — Create a new pod and attach your volume
+
+1. Go to **RunPod → Secure Cloud → Deploy**
+2. Select any GPU from the table above (1 GPU is sufficient)
+3. Container image: `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04`
+4. Container disk: **20 GB** (just needs the code + venv)
+5. Under **Volumes**, click **Attach Volume** → select your existing volume → mount at `/workspace`
+6. Deploy the pod
+
+> If you still have the original stopped pod, you can simply **Start** it again from the RunPod dashboard — the volume is already attached and the venv may still be intact.
+
+---
+
+### Step 2 — Connect and set up
+
+SSH in (or use the RunPod web terminal):
+
+```bash
+ssh root@<POD_IP> -p <PORT> -i ~/.ssh/amit_ssh_key
+```
+
+Check the volume and model are present:
+
+```bash
+ls /workspace/nanochat_cache/chatsft_checkpoints/d24/
+# should show model_000483.pt and meta_000483.json
+```
+
+Pull the latest code and activate the environment:
+
+```bash
+cd /workspace/nanochat
+git pull
+uv sync --extra gpu
+source .venv/bin/activate
+```
+
+---
+
+### Step 3 — Start the web UI
+
+```bash
+export NANOCHAT_BASE_DIR=/workspace/nanochat_cache
+
+# Web UI (recommended) — serves a ChatGPT-style interface on port 8000
+python -m scripts.chat_web --source sft
+
+# Or CLI chat
+python -m scripts.chat_cli --source sft -p "What is the capital of France?"
+```
+
+The server will print:
+```
+Server ready at http://localhost:8000
+```
+
+---
+
+### Step 4 — Access the web UI
+
+RunPod exposes ports via their proxy. Open this URL in your browser:
+
+```
+https://<POD_ID>-8000.proxy.runpod.net
+```
+
+Find your Pod ID in the RunPod dashboard (the string like `abc123def456`). The full URL will look like:
+```
+https://abc123def456-8000.proxy.runpod.net
+```
+
+Alternatively, use **SSH port forwarding** to access it locally:
+
+```bash
+ssh -L 8000:localhost:8000 root@<POD_IP> -p <PORT> -i ~/.ssh/amit_ssh_key
+# then open http://localhost:8000 in your browser
+```
+
+---
+
+### Step 5 — Stop when done
+
+From the RunPod dashboard, **Stop** (not Terminate) the pod. The volume persists at ~$1/day. You can restart anytime and the model will still be there.
+
+---
+
+### Useful flags
+
+```bash
+# Use multiple GPUs for faster generation (if you provisioned >1 GPU)
+python -m scripts.chat_web --source sft --num-gpus 2
+
+# Change port (e.g. if 8000 is taken)
+python -m scripts.chat_web --source sft --port 8080
+
+# Load the base model instead of SFT (raw pretraining output, no chat fine-tuning)
+python -m scripts.chat_web --source base
+```
+
+### What to expect from the SFT model
+
+The SFT model (483 steps fine-tuned from the 1.38B base) is a conversational assistant. At ChatCORE 0.36 it performs roughly at the level of a capable but small chat model — better than GPT-2, noticeably below GPT-3.5. It handles:
+
+- Factual Q&A on common topics
+- Simple reasoning and math (GSM8K: 6%)
+- Multiple choice questions (MMLU: 36%)
+- Spelling and letter counting (SpellingBee: 99.6%)
+- Short creative writing
+
+It will hallucinate confidently on obscure facts and struggle with multi-step reasoning.
+
+---
+
+## Exposing the Web UI on RunPod — What Actually Works
+
+The default instructions use port 8000, but several things get in the way on RunPod. Here is exactly what is required based on working through this end to end.
+
+### Problems with the default approach
+
+| Approach | What happens |
+|----------|-------------|
+| `chat_web` default port 8000 | Not exposed — RunPod proxy returns 404 |
+| `https://<pod-id>-8000.proxy.runpod.net` | 404 — port was never registered with the proxy |
+| SSH tunnel `ssh -L 8000:localhost:8000 ... ssh.runpod.io` | RunPod's SSH proxy does not support port forwarding |
+| Port 8888 | Already taken by Jupyter Lab |
+
+### Required changes before starting the pod
+
+**Step 1 — Edit the pod to expose port 7860**
+
+Before starting (or after stopping) the pod:
+1. Go to RunPod → Pods → **⋮** → **Edit Pod**
+2. Find the **Expose HTTP ports** field — it shows `8888` by default
+3. Change it to `8888,7860`
+4. Click **Save**, then start the pod
+
+This registers port 7860 with RunPod's proxy so the URL `https://<pod-id>-7860.proxy.runpod.net` works.
+
+### Starting the server
+
+Once the pod is running, open the web terminal and run:
+
+```bash
+cd /workspace/nanochat
+source .venv/bin/activate
+export NANOCHAT_BASE_DIR=/workspace/nanochat_cache
+python -m scripts.chat_web --source sft --port 7860
+```
+
+Wait for:
+```
+Server ready at http://localhost:7860
+```
+
+### Accessing the UI
+
+Open this URL in your browser (replace with your actual pod ID):
+
+```
+https://m9zlor3r8f9m1e-7860.proxy.runpod.net
+```
+
+Your pod ID is shown in the RunPod dashboard under the pod name. The full URL pattern is:
+```
+https://<pod-id>-<port>.proxy.runpod.net
+```
+
+### Restarting the server next time
+
+If the server is not running (e.g. after a pod restart), just re-run the four commands above in the web terminal. The model loads in ~3 seconds on H100.
+
+If you get `address already in use`:
+```bash
+pkill -f chat_web
+python -m scripts.chat_web --source sft --port 7860
+```
+
+### Summary of all required changes vs original instructions
+
+| What | Original | What works |
+|------|----------|------------|
+| HTTP port | 8000 (default) | 7860 |
+| Pod config | Not needed | Must add `7860` to Expose HTTP ports in Edit Pod |
+| Access URL | `localhost:8000` via SSH tunnel | `https://<pod-id>-7860.proxy.runpod.net` directly in browser |
+| SSH tunnel | `ssh -L 8000:...` | Not needed, and doesn't work via RunPod proxy |
+
+---
+
+## Copying the Model to Your Local Mac
+
+RunPod's SSH proxy does not support `scp` or `rsync`, and direct TCP connections are often blocked. The easiest way to download the model is to serve it over HTTP directly from the pod using Python's built-in HTTP server.
+
+### Steps
+
+**1. Stop the chat server** in the web terminal (Ctrl+C if it's running), then navigate to the checkpoint directory and start an HTTP server:
+
+```bash
+cd /workspace/nanochat_cache/chatsft_checkpoints/d24/
+python3 -m http.server 7860
+```
+
+**2. Open the file browser** in your Mac browser:
+
+```
+https://m9zlor3r8f9m1e-7860.proxy.runpod.net
+```
+
+You will see a directory listing of all checkpoint files.
+
+**3. Download these two files** by clicking them:
+
+- `model_000483.pt` (~4 GB) — the model weights
+- `meta_000483.json` (~1 KB) — the model config (required to load the model)
+
+**Skip** the `optim_000483_rank*.pt` files — those are optimizer states needed only for resuming training, not for inference.
+
+**4. Stop the HTTP server** (Ctrl+C in the web terminal) when done.
+
+### Running the model locally on Mac
+
+The model needs three things to run locally: the model weights, the model config, and the tokenizer. Download all three from the pod before stopping it.
+
+**Step 1 — Download model weights and config**
+
+Using the HTTP server method above, download from `chatsft_checkpoints/d24/`:
+- `model_000483.pt` (~4 GB)
+- `meta_000483.json` (~1 KB)
+
+**Step 2 — Download the tokenizer**
+
+The tokenizer is a separate file. Serve it from the pod:
+
+```bash
+cd /workspace/nanochat_cache
+python3 -m http.server 7860
+```
+
+Then open `https://<pod-id>-7860.proxy.runpod.net` in your browser, navigate into `tokenizer/`, and download `tokenizer.pkl`.
+
+**Step 3 — Create the directory structure**
+
+nanochat expects a specific layout under `NANOCHAT_BASE_DIR`. Create it and place the files:
+
+```bash
+# Create directories
+mkdir -p ~/Documents/nanochat/trained_model/chatsft_checkpoints/d24
+mkdir -p ~/Documents/nanochat/trained_model/tokenizer
+
+# Move model files (adjust source path to wherever your browser saved them)
+mv ~/Downloads/model_000483.pt ~/Documents/nanochat/trained_model/chatsft_checkpoints/d24/
+mv ~/Downloads/meta_000483.json ~/Documents/nanochat/trained_model/chatsft_checkpoints/d24/
+mv ~/Downloads/tokenizer.pkl ~/Documents/nanochat/trained_model/tokenizer/
+```
+
+The final structure should look like:
+```
+trained_model/
+├── chatsft_checkpoints/
+│   └── d24/
+│       ├── model_000483.pt
+│       └── meta_000483.json
+└── tokenizer/
+    └── tokenizer.pkl
+```
+
+**Step 4 — Install dependencies (first time only)**
+
+```bash
+cd ~/Documents/nanochat
+uv sync --extra cpu
+source .venv/bin/activate
+```
+
+**Step 5 — Start the web UI**
+
+```bash
+cd ~/Documents/nanochat
+source .venv/bin/activate
+export NANOCHAT_BASE_DIR=~/Documents/nanochat/trained_model
+python -m scripts.chat_web --source sft --port 7860
+```
+
+Wait for:
+```
+Server ready at http://localhost:7860
+```
+
+Then open **http://localhost:7860** in your browser.
+
+> **Note:** On Mac MPS (Apple Silicon) the model loads on the GPU automatically (`Autodetected device type: mps`). Generation will be noticeably slower than on H100 — expect a few seconds per response depending on length. The quality is identical to the RunPod deployment.
